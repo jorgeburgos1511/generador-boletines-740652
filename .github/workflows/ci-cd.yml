@@ -1,0 +1,109 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Extract sanitized branch name
+        id: vars
+        run: |
+          RAW_BRANCH="${{ github.ref_name }}"
+          CLEAN_BRANCH=$(echo "$RAW_BRANCH" | sed -E 's:^(feature/|hotfix/|bugfix/|release/)::')
+          echo "branch_name=$CLEAN_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Set version tag
+        run: |
+          echo "VERSION_TAG=1.0.${{ github.run_number }}-${{ steps.vars.outputs.branch_name }}" >> $GITHUB_ENV
+
+      - name: Verify build
+        run: python -c "import app; print('Build OK')"
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      docker_image: ${{ steps.set_image.outputs.docker_image }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract sanitized branch name
+        id: vars
+        run: |
+          RAW_BRANCH="${{ github.ref_name }}"
+          CLEAN_BRANCH=$(echo "$RAW_BRANCH" | sed -E 's:^(feature/|hotfix/|bugfix/|release/)::')
+          echo "branch_name=$CLEAN_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Set version tag
+        run: |
+          echo "VERSION_TAG=1.0.${{ github.run_number }}-${{ steps.vars.outputs.branch_name }}" >> $GITHUB_ENV
+
+      - name: Set Docker image name
+        id: set_image
+        run: |
+          IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$VERSION_TAG"
+          echo "docker_image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "DOCKER_IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t app-image .
+          docker tag app-image:latest $DOCKER_IMAGE
+          docker push $DOCKER_IMAGE
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - name: Set up SSH key
+        run: |
+          echo "${{ secrets.EC2_KEY }}" > /tmp/ssh_key.pem
+          chmod 600 /tmp/ssh_key.pem
+
+      - name: Deploy to EC2
+        run: |
+          DOCKER_IMAGE="${{ needs.docker.outputs.docker_image }}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            aws ecr get-login-password --region ${{ secrets.AWS_DEFAULT_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com
+            docker stop generador 2>/dev/null || true
+            docker rm generador 2>/dev/null || true
+            docker pull $DOCKER_IMAGE
+            docker run -d --name generador -p 8000:8000 \
+              -e AWS_REGION=${{ secrets.AWS_DEFAULT_REGION }} \
+              -e S3_BUCKET=practica-4-740652 \
+              -e SQS_QUEUE_URL=${{ secrets.SQS_QUEUE_URL }} \
+              $DOCKER_IMAGE
+          EOF
